@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local diagnostic output / backups — may contain session data
+*.log
+baseline.json
+*.bak
+backups/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Never commit anything from a real Hermes data root
+state.db
+config.yaml
+facts.json
+auth.json
+.env
+gateway.lock
+gateway.pid
+gateway_state.json

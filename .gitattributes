@@ -1,0 +1,14 @@
+# Normalize line endings on checkout, keep LF in the repository.
+# Windows contributors otherwise reintroduce CRLF and the diffs get noisy.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+LICENSE text eol=lf
+
+# Windows-only fixtures must keep their native form.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
