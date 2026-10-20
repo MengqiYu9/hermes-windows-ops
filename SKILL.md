@@ -59,7 +59,7 @@ The channel lives in `config.yaml` under `update.installs.<install_id>.channel` 
 ```yaml
 update:
   installs:
-    a1b2c3d4e5f60718:
+    769d039a6479ad7b:
       path: C:\Users\<user>\AppData\Local\hermes\hermes-agent
       channel: main
 ```
@@ -113,9 +113,17 @@ Verify with `hermes pm doctor` → `✓ git <ver>`.
 
 Read `references/pm-internals.md` for the `tree_digest` algorithm, the `facts.json` schema, and why `pm doctor` prints `-` rows that are not defects.
 
-## Failure mode 4 — desktop app: "Gateway inaccessible (authorization)"
+## Failure mode 4 — desktop cannot reach the gateway (session isolation)
 
-**Symptom:** desktop shows *Hermes couldn't start*; `desktop.log` has `Gateway inaccessible (authorization)`; `hermes gateway ensure` returns `{"state":"inaccessible","reason_code":"authorization","endpoint":null}`.
+**Symptom (older builds):** desktop shows *Hermes couldn't start*; `desktop.log` has `Gateway inaccessible (authorization). Use hermes gateway status for recovery.`
+
+**Symptom (0.22.2+canary, much better):**
+```
+Gateway inaccessible (gateway_other_session).
+The running gateway (PID <pid>) runs in another Windows logon session (session 0, e.g. a boot-time
+scheduled task), so this app cannot reach it. Stop it (hermes gateway stop from an administrator
+prompt) and let only one auto-start task launch the gateway.
+```
 
 **Root cause — Windows session isolation.** The gateway must resolve the **peer's SID** to authorize it:
 
@@ -123,32 +131,124 @@ Read `references/pm-internals.md` for the `tree_digest` algorithm, the `facts.js
 ensureLocalGateway → query_identify → gateway/runtime_bootstrap_windows.py::_process_sid(pid)
 ```
 
-`_process_sid()` calls `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `OpenProcessToken(TokenQuery)`. **Across Windows sessions this is denied**, raising `PermissionError`, which `hermes_cli/gateway_runtime.py` catches and reports as `reason_code="authorization"`.
+`_process_sid()` calls `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `OpenProcessToken(TokenQuery)`. **Across Windows sessions this is denied**, raising `PermissionError`.
 
 | Process | Session | SID readable |
 |---|---|---|
 | Gateway | `Services` / 0 | ❌ PermissionError |
 | Desktop | `Console` / 1 | ✅ |
 
-Check sessions before touching anything else:
+### ★ Check the scheduled task FIRST — this is the actual cause in most cases
 
-```bash
-tasklist /FI "IMAGENAME eq python.exe" /FO CSV | findstr /i "Services Console"
-```
-
-**Fix:** the gateway must run in the interactive session. **Start it from the user's own terminal, never from an agent sandbox** — sandbox-spawned background processes always land in Session 0.
+Do **not** start by inspecting processes, config, or environment variables. Run this and read the
+answer straight off:
 
 ```powershell
-hermes gateway stop
-hermes gateway start
+Get-ScheduledTask | Where-Object { $_.Principal.LogonType -eq 'S4U' }
 ```
 
-If `startup_watchdog: true` keeps yanking the gateway back to Session 0, temporarily set `gateway.startup_watchdog: false` in `config.yaml`. **A Windows logoff/login clears all Session 0 leftovers** and is the most reliable fallback.
+**`S4U` = "run whether or not the user is logged on" — such a task ALWAYS executes in Session 0**,
+no matter which session signs in. A stock `hermes gateway install` creates exactly one:
+
+```
+TaskName    : Hermes_Gateway
+Triggers    : MSFT_TaskLogonTrigger (delay = PT30S)
+Principal   : UserId=<user>  LogonType=S4U  RunLevel=Limited
+Action      : wscript.exe //B //Nologo "<home>\gateway-service\Hermes_Gateway.vbs"
+```
+
+So the loop is: sign in → 30 s later the S4U task launches the gateway into Session 0 → desktop
+(Session 1) can never authorize it → a manual `hermes gateway stop && start` fixes **that one
+login** and then it recurs.
+
+**Fix — re-register the task as `Interactive` so it lands in the user's session** (keeps autostart
+and messaging-platform connections working; requires Administrator):
+
+```powershell
+$home = "$env:LOCALAPPDATA\hermes"
+& "$home\bin\hermes.cmd" gateway stop
+
+Unregister-ScheduledTask -TaskName 'Hermes_Gateway' -Confirm:$false
+
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' `
+  -Argument "//B //Nologo `"$home\gateway-service\Hermes_Gateway.vbs`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive -RunLevel Limited
+$setts   = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries -StartWhenAvailable `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+
+Register-ScheduledTask -TaskName 'Hermes_Gateway' -Action $action -Trigger $trigger `
+  -Principal $princ -Settings $setts -Force
+
+Start-ScheduledTask -TaskName 'Hermes_Gateway'
+```
+
+Three settings that are easy to miss and cause their own bugs later:
+
+| Setting | Why |
+|---|---|
+| `-ExecutionTimeLimit ([TimeSpan]::Zero)` | Windows' default task limit is **3 days**; the gateway would be killed silently at the 3-day mark |
+| `-MultipleInstances IgnoreNew` | otherwise duplicate gateway processes accumulate on re-login |
+| `-StartWhenAvailable` | runs a missed logon trigger when the machine was asleep at sign-in |
+
+`Set-ScheduledTask` **cannot change** `LogonType` — Windows does not allow it, so the task must be
+unregistered and re-registered.
+
+Simpler alternative when messaging-platform autostart is not needed: `hermes gateway uninstall`,
+after which the desktop app launches the gateway itself in Session 1.
+
+### Clean up leftover Session 0 processes
+
+`hermes gateway stop` removes the outer process, but the watchdog shell and the supervisor it spawned
+survive and can re-launch a replacement. Kill them explicitly:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
+  $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+  if ($p -and $p.SessionId -eq 0) { Stop-Process -Id $_.ProcessId -Force }
+}
+```
+
+Requires Administrator; without it `Stop-Process` reports access denied and the chain survives.
+
+Verify the outcome — every Hermes process should be in Session 1:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
+  $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+  "{0,-6} Session {1}" -f $_.ProcessId, $p.SessionId
+}
+```
+
+### ★ Never drive `hermes gateway stop` / `start` from an agent sandbox
+
+A sandbox spawns background processes into **Session 0**. Stopping the gateway there lets the watchdog
+relaunch it **still in Session 0**, which reproduces the failure and cannot be undone from inside the
+sandbox (`taskkill /F` returns access denied). The gateway must be started by the user, in an
+interactive (Console) session. Toggling `gateway.startup_watchdog: false` in `config.yaml` does **not**
+help — the process doing the relaunching is already running and keeps doing so.
+
+### The desktop will not self-heal either
+
+`apps/desktop/electron/local-gateway.ts` has a `createStaleGatewayRestarter` that can kill and replace
+a gateway it cannot reach (it runs in Session 1 and has more privilege). It does not fire here:
+
+```ts
+const stale = restartStale && result.code === 0 && payload.state === 'ready'
+              ? staleGatewayCode(payload) : null   // only when state === 'ready'
+```
+
+and `staleGatewayCode()` compares only `endpoint.code_sha` against `client_code_sha` — identical
+builds are not stale. So `state: inaccessible` + matching versions means the desktop retries forever
+while the Session 0 owner never exits. **Waiting does not help.**
 
 Ruling out the alternatives:
 
 - Not a version mismatch — compare `client_code_sha` from `gateway ensure` against `code_sha` in `gateway_state.json`; equal means the handshake failed later, at authorization.
 - Not token corruption — check `%APPDATA%\Hermes\secure-token-storage.json` (`{"on":false,"migrated":true}` is normal) and `connections.json`.
+- Not missing credentials — do **not** chase `${VAR}` env expansion or `.env` formatting when the message says "other session". An upstream commit (`eecaa7af9a`, refs #139845 / #140252) added `gateway_other_session` / `gateway_elevated` precisely because `authorization` was a misleading catch-all.
 
 Read `references/gateway-authorization.md` for the full call chain, every `reason_code` value, and which log file carries which evidence.
 

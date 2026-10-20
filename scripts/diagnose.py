@@ -212,7 +212,7 @@ def _parse_channel_map(cfg: str) -> dict[str, str]:
 
         update:
           installs:
-            a1b2c3d4e5f60718:
+            769d039a6479ad7b:
               path: ...
               channel: main
 
@@ -361,12 +361,73 @@ def check_gateway(home: Path) -> None:
     session0 = "Services" in line
     if session0:
         record(FAIL, f"pid {pid} session", "Services (0)",
-               "desktop (Console/1) cannot read this process token, so "
-               "`gateway ensure` returns reason_code=authorization. Restart the "
-               "gateway from the user's own terminal: hermes gateway stop && "
-               "hermes gateway start")
+               "the desktop (Console/1) cannot read this process token, so the "
+               "handshake fails. Do NOT restart it from a sandbox -- that lands "
+               "it back in Session 0. Check for an S4U scheduled task (see "
+               "check_scheduled_tasks); the usual fix is to re-register "
+               "Hermes_Gateway with -LogonType Interactive.")
     else:
         record(OK, f"pid {pid} session", "Console (interactive)")
+
+    # Other python processes in Session 0 are the leftover supervisor chain; they
+    # re-spawn the gateway, so they must go too.
+    rc, out = run(["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV"])
+    strays = [l for l in out.splitlines()
+              if "Services" in l and "python.exe" in l]
+    if strays:
+        pids = ", ".join(l.split(",")[1].strip('"')
+                         for l in strays if l.count(",") >= 2)
+        record(WARN, "python processes in Session 0", pids or f"{len(strays)}",
+               "leftover watchdog/supervisor chain; it re-launches the gateway "
+               "into Session 0. Remove as Administrator: Get-CimInstance "
+               "Win32_Process -Filter \"Name='python.exe'\" | Where-Object "
+               "{(Get-Process -Id $_.ProcessId).SessionId -eq 0} | "
+               "Stop-Process -Force")
+
+
+def check_scheduled_tasks(home: Path) -> None:
+    """★ The real root cause of gateway session problems lives here.
+
+    An S4U ("run whether or not the user is logged on") task always executes in
+    Session 0, so a stock `hermes gateway install` guarantees the desktop can
+    never reach the gateway. Read-only; uses PowerShell.
+    """
+    print("\n=== 5b. Scheduled tasks (LogonType) ===")
+    ps = (
+        "Get-ScheduledTask | Where-Object { $_.TaskName -match 'hermes' "
+        "-or ($_.Actions | Out-String) -match 'hermes' } | "
+        "ForEach-Object { '{0}|{1}' -f $_.TaskName, $_.Principal.LogonType }"
+    )
+    rc, out = run(["powershell", "-NoProfile", "-Command", ps])
+    rows = [l.strip() for l in out.splitlines() if "|" in l]
+
+    if rc != 0:
+        record(WARN, "scheduled task scan", "powershell unavailable or errored",
+               out.strip()[:140])
+        return
+    if not rows:
+        record(INFO, "scheduled tasks", "none matching 'hermes'")
+        return
+
+    s4u = []
+    for row in rows:
+        name, _, logon = row.partition("|")
+        if logon.strip().lower() in ("s4u", "serviceaccount"):
+            s4u.append(name)
+            record(FAIL, f"task {name}", f"LogonType={logon.strip()}",
+                   "S4U tasks ALWAYS run in Session 0, so the desktop (Session 1) "
+                   "can never authorize the gateway. Re-register it with "
+                   "-LogonType Interactive (Administrator); see SKILL.md "
+                   "failure mode 4.")
+        else:
+            record(OK if logon.strip().lower() == "interactive" else WARN,
+                   f"task {name}", f"LogonType={logon.strip()}",
+                   "" if logon.strip().lower() == "interactive"
+                   else "not Interactive; verify it runs in your session")
+
+    if not s4u:
+        record(OK, "no S4U gateway task",
+               "the scheduled-task cause of Session 0 gateways is ruled out")
 
 
 # ------------------------------------------------------------- 6. data
@@ -449,7 +510,7 @@ def main() -> int:
     print("=" * 66)
 
     for fn in (check_layout, check_git, check_channel, check_tools,
-               check_gateway, check_data):
+               check_gateway, check_scheduled_tasks, check_data):
         try:
             fn(home)
         except Exception as exc:  # a broken check must not abort the rest

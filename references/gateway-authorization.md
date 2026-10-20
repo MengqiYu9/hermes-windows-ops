@@ -90,26 +90,97 @@ means the versions agree, so an `authorization` verdict is about identity
 
 ## Correct startup procedure
 
+**First, find out whether a scheduled task is the cause.** This is the step that
+matters most, and it is easy to skip:
+
+```powershell
+Get-ScheduledTask | Where-Object { $_.TaskName -match 'hermes' `
+  -or ($_.Actions | Out-String) -match 'hermes' } |
+  Select-Object TaskName, State, @{n='LogonType';e={$_.Principal.LogonType}}
+```
+
+A stock `hermes gateway install` registers `Hermes_Gateway` with
+`LogonType=S4U`, triggered 30 s after logon. **S4U means "run whether or not
+the user is logged on", and such tasks always execute in Session 0.** That is
+the entire cause: sign in → 30 s → gateway in Session 0 → the desktop in
+Session 1 can never authorize it.
+
+If `LogonType` is `S4U`, manual restarts only fix one login at a time.
+Re-register the task as `Interactive` instead (Administrator; see SKILL.md
+failure mode 4 for the full command). `Set-ScheduledTask` cannot change
+`LogonType`, so the task has to be unregistered and re-registered.
+
+When there is no such task (or it is already `Interactive`), a plain restart in
+the user's own terminal is enough:
+
 ```powershell
 # In the user's own terminal (Console session)
 hermes gateway stop
 hermes gateway start
 ```
 
-If `gateway.startup_watchdog: true` in `config.yaml` keeps re-launching the
-gateway — each `gateway stop` is followed by a `gateway.start` about 20 seconds
-later in `logs/gateway-exit-diag.log` — set it to `false` temporarily so the
-gateway stays in the interactive session. Restore it afterwards.
+**`gateway.startup_watchdog: false` does NOT help.** The process doing the
+relaunching is the watchdog supervisor itself, which is already running; a
+config change does not stop it, and 20 s after `gateway stop` the log shows
+`gateway exited (code 0) - restarting in 10s` followed by
+`gateway not running - launching`.
 
-**Never start the gateway from an agent sandbox.** Background processes spawned
-there land in Session 0 and are not killable from the sandbox: `taskkill /F`
-reports access denied, and the process command line is unreadable. `hermes
-gateway stop` stops the outermost process, but the watchdog immediately
+**Never start or stop the gateway from an agent sandbox.** Background processes
+spawned there land in Session 0 and are not killable from the sandbox:
+`taskkill /F` reports access denied and the command line is unreadable.
+`hermes gateway stop` stops the outermost process, but the watchdog immediately
 rebuilds the chain (typically ~4 MB supervisor + ~40 MB helper + ~220-440 MB
-gateway), reproducing the failure.
+gateway) **still in Session 0**, reproducing the failure.
 
-**A Windows logoff/login clears every Session 0 leftover** and is the most
-reliable fallback when the process chain is already established.
+Kill the whole chain from an Administrator PowerShell:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
+  $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+  if ($p -and $p.SessionId -eq 0) { Stop-Process -Id $_.ProcessId -Force }
+}
+```
+
+**A Windows logoff/login clears every Session 0 leftover** and remains the
+most reliable fallback when the process chain is already established.
+
+## The desktop will not recover on its own
+
+`apps/desktop/electron/local-gateway.ts` can kill and replace a gateway it
+cannot reach — `createStaleGatewayRestarter` (`main.ts`) is wired in and the
+desktop holds more privilege from Session 1. It does not fire in this case:
+
+```ts
+const stale = restartStale && result.code === 0 && payload.state === 'ready'
+              ? staleGatewayCode(payload) : null
+```
+
+`staleGatewayCode()` compares `endpoint.code_sha` with `client_code_sha` only;
+identical builds are not stale. So `state: inaccessible` + matching versions
+means the desktop retries forever while the Session 0 owner never exits.
+**Waiting does not help** — this is worth knowing before suggesting a retry.
+
+## Upstream added precise diagnostics in 0.22.2+canary
+
+Commit `eecaa7af9a` (refs #139845, #140252) — *fix(windows): name an elevated
+or other-session gateway instead of "authorization"* — replaces the misleading
+catch-all with real verdicts:
+
+| reason_code | Meaning |
+|---|---|
+| `gateway_other_session` | owner runs in a different session (names the PID) |
+| `gateway_elevated` | owner is elevated / its token cannot be opened |
+| `authorization` | anything else — the old catch-all |
+
+Code: `gateway/runtime_bootstrap_windows.py` (`GATEWAY_ELEVATED`,
+`GATEWAY_OTHER_SESSION`), `hermes_cli/gateway_runtime.py` (names the cause,
+falls back to `authorization`).
+
+**Practical consequence: check `reason_code` before chasing credentials.** An
+earlier diagnosis of this symptom went down the `${VAR}` env-expansion path for
+hours before the upgrade revealed `gateway_other_session`, which named the
+cause in one line. Upgrading often brings better diagnostics than the code
+around them.
 
 ## Logs that carry the evidence
 
