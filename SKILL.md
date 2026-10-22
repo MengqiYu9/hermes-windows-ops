@@ -196,18 +196,60 @@ Three settings that are easy to miss and cause their own bugs later:
 `Set-ScheduledTask` **cannot change** `LogonType` — Windows does not allow it, so the task must be
 unregistered and re-registered.
 
+### ★ A logon trigger alone is not self-healing
+
+The re-registered task above only fires **at logon**. If the gateway dies mid-session the task never
+runs again, and the machine stays broken until the next sign-in. Add a recurring trigger so the
+task itself provides recovery:
+
+```powershell
+$t1 = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+$t2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+     -RepetitionInterval (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName 'Hermes_Gateway' -Action $action `
+  -Trigger @($t1, $t2) -Principal $princ -Settings $setts -Force
+```
+
+Any self-healing mechanism that only watches a lock file and respawns the process inherits **its own
+session** — so such a watcher placed in Session 0 is worse than nothing: it fills every gap by
+recreating the failure. Check that any pre-existing watchdog/task belongs to the intended session
+before trusting it.
+
+### Kill the whole orphan chain, not just python.exe
+
+A watcher is usually a `powershell.exe` that spawned the python supervisor. When the root exits
+(e.g. logoff) the children survive as orphans holding inherited handles, so filtering on
+`Name='python.exe'` misses the top of the chain. Enumerate by session instead:
+
+```powershell
+Get-CimInstance Win32_Process | ForEach-Object {
+  $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+  if ($p -and $p.SessionId -eq 0 -and $_.Name -match 'python|powershell|wscript') {
+    $_.Name, $_.ProcessId, $_.ParentProcessId
+  }
+}
+```
+
+Note that `Get-Process` exposes `SessionId` while `Win32_Process` does not; both are needed. Also
+hand-made watchers are common — confirm a watchdog script is actually one Hermes ships
+(`gateway_windows.py` generates `Hermes_Gateway` and `Hermes_Gateway.vbs`, and nothing else) before
+blaming the product for its behaviour.
+
 Simpler alternative when messaging-platform autostart is not needed: `hermes gateway uninstall`,
 after which the desktop app launches the gateway itself in Session 1.
 
 ### Clean up leftover Session 0 processes
 
 `hermes gateway stop` removes the outer process, but the watchdog shell and the supervisor it spawned
-survive and can re-launch a replacement. Kill them explicitly:
+survive and can re-launch a replacement. Kill them explicitly — matching only on `python.exe` leaves
+the `powershell.exe` at the root of the chain:
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
+Get-CimInstance Win32_Process | ForEach-Object {
   $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-  if ($p -and $p.SessionId -eq 0) { Stop-Process -Id $_.ProcessId -Force }
+  if ($p -and $p.SessionId -eq 0 -and $_.Name -match 'python|powershell|wscript') {
+    Stop-Process -Id $_.ProcessId -Force
+  }
 }
 ```
 
@@ -221,6 +263,28 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
   "{0,-6} Session {1}" -f $_.ProcessId, $p.SessionId
 }
 ```
+
+### Verify the fix without trusting a cached pid
+
+`gateway_state.json` is rewritten asynchronously, so a script that starts the gateway and then reads
+the pid straight out of the file can read the **previous** (just-killed) gateway and report a false
+failure. Poll for the pid to change before judging the session:
+
+```powershell
+$old = (Get-Content $StateFile -Raw | ConvertFrom-Json).pid
+Start-ScheduledTask -TaskName 'Hermes_Gateway'
+1..12 | ForEach-Object {
+    Start-Sleep -Seconds 2
+    $new = (Get-Content $StateFile -Raw | ConvertFrom-Json).pid
+    if ($new -and $new -ne $old) {
+        (Get-Process -Id $new).SessionId
+        break
+    }
+}
+```
+
+The same trap applies to cleanup output: processes killed a moment ago may still appear in a process
+list taken immediately afterwards. Re-check before reporting leftovers.
 
 ### ★ Never drive `hermes gateway stop` / `start` from an agent sandbox
 
