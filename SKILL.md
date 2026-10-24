@@ -316,6 +316,84 @@ Ruling out the alternatives:
 
 Read `references/gateway-authorization.md` for the full call chain, every `reason_code` value, and which log file carries which evidence.
 
+## Failure mode 6 — a named custom provider's `${VAR}` key is not expanded in the gateway's frozen scope
+
+**Symptom:** the gateway runs, old sessions work, but **every new session fails**:
+
+```
+WARNING gateway.run: Model resolution failed for session agent:main:local:dm:local-<id>:
+  provider 'custom' resolved without credentials (no endpoint or API key configured).
+  If this is a named custom provider, use its real name (see providers: in config.yaml).
+```
+
+`hermes auth status <name>` says `logged out`, yet the CLI works and the endpoint answers. A
+`provider 'custom'` in the message is **not** a wrong provider name — a `providers:` entry that is
+not in the built-in registry resolves to `custom` by design.
+
+**The distinguishing observation:** in the same gateway process at the same moment, one session
+succeeds and another fails. Sessions that once worked carry `billing_provider` / `billing_base_url`
+in `state.db` (the resolution was cached at creation), so they skip resolution entirely. A fresh
+session must resolve again — and that is where it breaks.
+
+**Root cause.** A gateway turn resolves the route against the session's **frozen** config — the
+snapshot taken when the session was created (`gateway/run_turn_prepare.py` →
+`policy.effective(authority)` → `frozen`). Inside `frozen_runtime_config(frozen)`,
+`hermes_cli/config.py::_expand_env_vars` does **not** expand `${VAR}` in the frozen block, so a
+`providers:` entry written as
+
+```yaml
+providers:
+  ark:
+    base_url: <provider base_url>
+    api_key: ${ARK_API_KEY}        # never expanded in the frozen scope
+```
+
+hands the resolver the literal string `${ARK_API_KEY}`. It is 13 characters, so
+`has_usable_secret()` accepts it, and the request goes out carrying the placeholder — which the
+endpoint rejects, surfacing as "no endpoint or API key configured".
+
+The path that fails is `gateway/session_worker_construct.py::route_runtime` →
+`_resolve_named_custom_runtime(requested="custom", explicit_base_url=launch_url, ...)` →
+`_resolve_direct_alias_runtime` (requested is `custom` and a launch URL is present, so the named
+provider's own `api_key` is not consulted the way it is on the live path).
+
+**Why it is hard to find.** Every live-path test passes. In a clean process,
+`resolve_runtime_provider(requested="ark")` resolves fine, and so does
+`get_secret()`/`_env_ref_lookup()` under a profile secret scope. Only the **frozen** path skips the
+expansion, and only a real gateway turn reaches it. Reproduce it deliberately:
+
+```python
+from hermes_cli.config import load_config
+from hermes_cli.runtime_provider import frozen_runtime_config
+from hermes_cli.runtime_provider_custom import _resolve_direct_alias_runtime
+
+with frozen_runtime_config(load_config()):
+    rt = _resolve_direct_alias_runtime("custom", None, "<the provider's base_url>")
+    print(rt.get("api_key"))     # '${ARK_API_KEY}' -> the bug; a real key -> fixed
+```
+
+**Fix — write the value literally in `config.yaml`.** It then resolves identically on the live,
+frozen, scoped and subprocess paths, with no dependency on env loading or scope:
+
+```yaml
+providers:
+  ark:
+    base_url: <provider base_url>
+    api_mode: codex_responses
+    model: ark-code-latest
+    api_key: <the actual key>
+```
+
+The literal value is **stable**: `hermes_cli/config.py::_preserve_env_ref_templates` only restores a
+`${VAR}` template when the on-disk text still contains one, so a file that no longer has the
+placeholder is left alone by later `save_config()` calls. Keep the same key in `.env` for anything
+that reads it from there.
+
+**Verify after the change** — restart the gateway (frozen snapshots are taken at session creation,
+so existing sessions keep the broken snapshot) and confirm a **new** session works. Check
+`logs/errors.log` for `Model resolution failed` and `logs/agent.log` for the traceback, which shows
+the whole path from `route_runtime` to the resolver.
+
 ## Failure mode 5 — sandbox delete interceptions
 
 `[safe-delete][SAFE_DELETE_BULK_GUARD_ERROR] failed to read/stat …` is **the sandbox shim, not a Windows ACL or admin-rights problem**. It intercepts PowerShell `Remove-Item`, `cmd del`, and Python `os.unlink`, including under `dangerouslyDisableSandbox`. Do not escalate privileges in response to it.
